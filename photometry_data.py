@@ -606,13 +606,19 @@ class Session:
             raise ValueError(f"anchor must be 'trial' or 'fit', got {a!r}")
         return a
 
-    def event_times(self, event: str, clock: str = "photometry",
+    def event_times(self, event, clock: str = "photometry",
                     anchor: str | None = None) -> np.ndarray:
         """Per-trial times of one event, one value per trial.
 
         ``event`` is a trial-table column of trial-relative times -- typically
         ``"<State>_on"`` or ``"<State>_off"`` (``"Cue1_on"``, ``"Reward_on"``,
         ...) -- or ``"trial_start"`` / ``"trial_end"``, already session clock.
+
+        It may also be a tuple of such columns, for an event that lives in one
+        of several states depending on the trial: ``("Cue1_on", "Cue2_on")`` is
+        "whichever cue this trial played", ``("Reward_on", "NoReward_on")`` the
+        outcome. Each trial takes the earliest of them it actually entered, NaN
+        if none.
 
         clock: "photometry" (default), "bpod" (Bpod session clock), or "trial"
         (raw trial-relative, as stored).
@@ -623,14 +629,19 @@ class Session:
         """
         df = self.trials
         start = df["trial_start"].to_numpy(dtype=float)
-        if event in ("trial_start", "trial_end"):
+        if isinstance(event, str) and event in ("trial_start", "trial_end"):
             bpod = df[event].to_numpy(dtype=float)
             rel = bpod - start
         else:
-            if event not in df.columns:
-                raise KeyError(f"{event!r} not in trial table; try one of "
+            cols = (event,) if isinstance(event, str) else tuple(event)
+            missing = [c for c in cols if c not in df.columns]
+            if missing:
+                raise KeyError(f"{missing} not in trial table; try one of "
                                f"{[c for c in df.columns if c.endswith(('_on', '_off'))]}")
-            rel = df[event].to_numpy(dtype=float)
+            R = df[list(cols)].to_numpy(dtype=float)
+            # fmin.reduce skips NaN where any column has a value, and leaves NaN
+            # only where the trial entered none of the states.
+            rel = np.fmin.reduce(R, axis=1)
             bpod = rel + start
 
         if clock == "trial":
@@ -663,14 +674,36 @@ class Session:
                     for i, lk in enumerate(licks)]
         raise ValueError(f"unknown clock {clock!r}")
 
+    @property
+    def cue_states(self) -> list[str]:
+        """The protocol's cue states, ``["Cue1", "Cue2", ...]``, in name order."""
+        return sorted(c[:-3] for c in self.trials.columns
+                      if re.fullmatch(r"Cue\d+_on", c))
+
+    def is_operant(self, tol: float = 0.01) -> bool:
+        """True when the cue ends on the animal's response, not on a timer.
+
+        In a classical protocol every cue state lasts the same fixed time, so
+        the outcome sits a fixed delay after cue onset. In an operant one the
+        cue ends at the first lick, so that delay varies trial to trial and
+        nothing downstream of the cue can be derived from the sync line -- it
+        has to come from Bpod's own state times. ``tol`` (seconds) absorbs
+        Bpod's 0.1 ms state-timing jitter.
+        """
+        d = np.concatenate([
+            (self.trials[f"{c}_off"] - self.trials[f"{c}_on"]).dropna().to_numpy()
+            for c in self.cue_states] or [np.array([])])
+        return bool(d.size > 1 and np.ptp(d) > tol)
+
     def signal(self, which: str = "F") -> np.ndarray:
         """A whole-session trace: "F", "iso", "F_subtr", or "F_iso_regressed"."""
         return signal_of(self.photo, which)
 
     def _events(self, event, trials=None, anchor=None) -> np.ndarray:
         """Photometry-clock event times, optionally subset by trial."""
-        ev = (self.event_times(event, "photometry", anchor=anchor)
-              if isinstance(event, str)
+        names = isinstance(event, str) or (
+            isinstance(event, tuple) and all(isinstance(e, str) for e in event))
+        ev = (self.event_times(event, "photometry", anchor=anchor) if names
               else np.atleast_1d(np.asarray(event, dtype=float)))
         return ev if trials is None else ev[np.asarray(trials)]
 
@@ -678,8 +711,9 @@ class Session:
               fill=np.nan, anchor=None):
         """Peri-event signal matrix.
 
-        event   trial-table column name (see :meth:`event_times`), or an array
-                of times already on the photometry clock.
+        event   trial-table column name or tuple of them (see
+                :meth:`event_times`), or an array of times already on the
+                photometry clock.
         window  (before, after) in seconds; ``before`` is normally negative.
         which   which trace, per :meth:`signal`.
         trials  bool mask or index array, applied before extraction.
